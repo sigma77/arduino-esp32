@@ -31,7 +31,8 @@ static const char * _err2str(uint8_t _error){
         return ("Bad Argument");
     } else if(_error == UPDATE_ERROR_ABORT){
         return ("Aborted");
-    }
+    } else if(_error == UPDATE_ERROR_DECRYPT){
+        return ("Decryption error"); 
     return ("UNKNOWN");
 }
 
@@ -59,6 +60,9 @@ bool UpdateClass::_enablePartition(const esp_partition_t* partition){
 
 UpdateClass::UpdateClass()
 : _error(0)
+, _cryptKey(0)
+, _cryptBuffer(0)
+, _skipBuffer(0)
 , _buffer(0)
 , _bufferLen(0)
 , _size(0)
@@ -67,6 +71,9 @@ UpdateClass::UpdateClass()
 , _paroffset(0)
 , _command(U_FLASH)
 , _partition(NULL)
+, _cryptCfg(0xf)
+, _cryptAddress(0)
+, _cryptMode(U_AES_DECRYPT_AUTO)
 {
 }
 
@@ -76,8 +83,14 @@ UpdateClass& UpdateClass::onProgress(THandlerFunction_Progress fn) {
 }
 
 void UpdateClass::_reset() {
+    if (_cryptBuffer)
+        delete[] _cryptBuffer;
+    if (_skipBuffer)
+        delete[] _skipBuffer;
     if (_buffer)
         delete[] _buffer;
+    _cryptBuffer = 0;
+    _skipBuffer = 0;
     _buffer = 0;
     _bufferLen = 0;
     _progress = 0;
@@ -170,6 +183,49 @@ bool UpdateClass::begin(size_t size, int command, int ledPin, uint8_t ledOn, con
     return true;
 }
 
+bool UpdateClass::setupCrypt(const uint8_t *cryptKey, size_t cryptAddress, uint8_t cryptConfig, int cryptMode){
+    if(setCryptKey(cryptKey)){
+        if(setCryptMode(cryptMode)){
+            setCryptAddress(cryptAddress);
+            setCryptConfig(cryptConfig);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool UpdateClass::setCryptKey(const uint8_t *cryptKey){
+    if(!cryptKey){
+        if (_cryptKey){
+            delete[] _cryptKey;
+            _cryptKey = 0;
+            log_d("AES key unset");
+        }
+        return false; //key cleared, no key to decrypt with
+    }
+    //initialize
+    if(!_cryptKey){
+        _cryptKey = (uint8_t*)malloc(ENCRYPTED_KEY_SIZE);
+    }
+    if(!_cryptKey){
+      log_e("malloc failed");
+      return false;
+    }    
+    memcpy(_cryptKey, cryptKey, ENCRYPTED_KEY_SIZE);
+    return true;
+}
+
+bool UpdateClass::setCryptMode(const int cryptMode){
+    if(cryptMode >= U_AES_DECRYPT_NONE && cryptMode <= U_AES_DECRYPT_ON){
+        _cryptMode = cryptMode;
+    }else{
+        log_e("bad crypt mode arguement %i", cryptMode);
+        return false;
+    }
+    return true;
+}
+
+
 void UpdateClass::_abort(uint8_t err){
     _reset();
     _error = err;
@@ -179,7 +235,119 @@ void UpdateClass::abort(){
     _abort(UPDATE_ERROR_ABORT);
 }
 
+void UpdateClass::_cryptKeyTweak(size_t cryptAddress, uint8_t *tweaked_key){
+    memcpy(tweaked_key, _cryptKey, ENCRYPTED_KEY_SIZE );
+    if(_cryptCfg == 0)  return; //no tweaking needed, use crypt key as-is
+
+    const uint8_t pattern[] = { 23, 23, 23, 14, 23, 23, 23, 12, 23, 23, 23, 10, 23, 23, 23, 8 };
+    int pattern_idx = 0;
+    int key_idx = 0;
+    int bit_len = 0;
+    uint32_t tweak = 0;
+    cryptAddress &= 0x00ffffe0; //bit 23-5
+    cryptAddress <<= 8; //bit23 shifted to bit31(MSB)
+    while(pattern_idx < sizeof(pattern)){
+        tweak = cryptAddress<<(23 - pattern[pattern_idx]); //bit shift for small patterns
+//      tweak = rotl32(tweak,8 - bit_len);
+        tweak = (tweak<<(8 - bit_len)) | (tweak>>(24 + bit_len)); //rotate to line up with end of previous tweak bits
+        bit_len += pattern[pattern_idx++] - 4; //add number of bits in next pattern(23-4 = 19bits = 23bit to 5bit)
+        while(bit_len > 7){
+            tweaked_key[key_idx++] ^= tweak; //XOR byte
+//          tweak = rotl32(tweak, 8);
+            tweak = (tweak<<8) | (tweak>>24); //compiler should optimize to use rotate(fast)
+            bit_len -=8;
+        }
+        tweaked_key[key_idx] ^= tweak; //XOR remaining bits, will XOR zeros if no remaining bits
+    }
+    if(_cryptCfg == 0xf)  return; //return with fully tweaked key
+
+    //some of tweaked key bits need to be restore back to crypt key bits
+    const uint8_t cfg_bits[] = { 67, 65, 63, 61 };
+    key_idx = 0;
+    pattern_idx = 0;
+    while(key_idx < ENCRYPTED_KEY_SIZE){
+        bit_len += cfg_bits[pattern_idx];
+        if( (_cryptCfg & (1<<pattern_idx)) == 0 ){ //restore crypt key bits
+            while(bit_len > 0){
+                if( bit_len > 7 || ((_cryptCfg & (2<<pattern_idx)) == 0) ){ //restore a crypt key byte
+                    tweaked_key[key_idx] = _cryptKey[key_idx];
+                }else{ //MSBits restore crypt key bits, LSBits keep as tweaked bits
+                    tweaked_key[key_idx] &= (0xff>>bit_len);
+                    tweaked_key[key_idx] |= (_cryptKey[key_idx] & (~(0xff>>bit_len)) );
+                }
+                key_idx++;
+                bit_len -= 8;
+            }
+        }else{ //keep tweaked key bits
+            while(bit_len > 0){
+                if( bit_len <8 && ((_cryptCfg & (2<<pattern_idx)) == 0) ){ //MSBits keep as tweaked bits, LSBits restore crypt key bits
+                    tweaked_key[key_idx] &= (~(0xff>>bit_len));
+                    tweaked_key[key_idx] |= (_cryptKey[key_idx] & (0xff>>bit_len));
+                }
+                key_idx++;
+                bit_len -= 8;
+            }
+        }
+        pattern_idx++;
+    }
+}
+
+bool UpdateClass::_decryptBuffer(){
+    if(!_cryptKey){
+        log_w("AES key not set");
+        return false;
+    }
+    if(_bufferLen%ENCRYPTED_BLOCK_SIZE !=0 ){
+        log_e("buffer size error");
+        return false;      
+    }    
+    if(!_cryptBuffer){
+        _cryptBuffer = (uint8_t*)malloc(ENCRYPTED_BLOCK_SIZE);
+    }
+    if(!_cryptBuffer){
+        log_e("malloc failed");
+        return false;
+    }
+    uint8_t tweaked_key[ENCRYPTED_KEY_SIZE]; //tweaked crypt key
+    int done = 0;
+
+    esp_aes_context ctx; //initialize AES
+    esp_aes_init( &ctx );
+    while((_bufferLen - done) >= ENCRYPTED_BLOCK_SIZE){
+        for(int i=0; i < ENCRYPTED_BLOCK_SIZE; i++) _cryptBuffer[(ENCRYPTED_BLOCK_SIZE - 1) - i] = _buffer[i + done]; //reverse order 16 bytes to decrypt
+        if( ((_cryptAddress + _progress + done) % ENCRYPTED_TWEAK_BLOCK_SIZE) == 0 || done == 0 ){
+            _cryptKeyTweak(_cryptAddress + _progress + done, tweaked_key); //update tweaked crypt key
+            if( esp_aes_setkey( &ctx, tweaked_key, 256 ) ){
+                return false;
+            }
+        }
+        if( esp_aes_crypt_ecb( &ctx, ESP_AES_ENCRYPT, _cryptBuffer, _cryptBuffer ) ){ //use ESP_AES_ENCRYPT to decrypt flash code
+            return false;
+        }
+        for(int i=0; i < ENCRYPTED_BLOCK_SIZE; i++) _buffer[i + done] = _cryptBuffer[(ENCRYPTED_BLOCK_SIZE - 1) - i]; //reverse order 16 bytes from decrypt
+        done += ENCRYPTED_BLOCK_SIZE;
+    }
+    return true;
+}
+
 bool UpdateClass::_writeBuffer(){
+    //first bytes of loading image, check to see if loading image needs decrypting
+    if(!_progress){
+        _cryptMode &= U_AES_DECRYPT_MODE_MASK;
+        if(  ( _cryptMode == U_AES_DECRYPT_ON )
+          || ((_command == U_FLASH) && (_cryptMode & U_AES_DECRYPT_AUTO) && (_buffer[0] != ESP_IMAGE_HEADER_MAGIC))
+        ){
+            _cryptMode |= U_AES_IMAGE_DECRYPTING_BIT; //set to decrypt the loading image
+            log_d("Decrypting OTA Image");
+        }
+    }
+    //check if data in buffer needs decrypting
+    if( _cryptMode & U_AES_IMAGE_DECRYPTING_BIT ){
+        if( !_decryptBuffer() ){
+            _abort(UPDATE_ERROR_DECRYPT);
+            return false;
+        }
+    }
     //first bytes of new firmware
     uint8_t skip = 0;
     if(!_progress && _command == U_FLASH){
@@ -193,10 +361,13 @@ bool UpdateClass::_writeBuffer(){
         //not written at this point so that partially written firmware
         //will not be bootable
         skip = ENCRYPTED_BLOCK_SIZE;
-        _skipBuffer = (uint8_t*)malloc(skip);
+        //_skipBuffer = (uint8_t*)malloc(skip);
+        if(!_skipBuffer){
+            _skipBuffer = (uint8_t*)malloc(skip);
+        }
         if(!_skipBuffer){
             log_e("malloc failed");
-        return false;
+             return false;
         }
         memcpy(_skipBuffer, _buffer, skip);
     }
@@ -221,9 +392,9 @@ bool UpdateClass::_writeBuffer(){
     }
 
     //restore magic or md5 will fail
-    if(!_progress && _command == U_FLASH){
-        _buffer[0] = ESP_IMAGE_HEADER_MAGIC;
-    }
+    //if(!_progress && _command == U_FLASH){
+    //    _buffer[0] = ESP_IMAGE_HEADER_MAGIC;
+    //}
     _md5.add(_buffer, _bufferLen);
     _progress += _bufferLen;
     _bufferLen = 0;
@@ -233,18 +404,18 @@ bool UpdateClass::_writeBuffer(){
     return true;
 }
 
-bool UpdateClass::_verifyHeader(uint8_t data) {
-    if(_command == U_FLASH) {
-        if(data != ESP_IMAGE_HEADER_MAGIC) {
-            _abort(UPDATE_ERROR_MAGIC_BYTE);
-            return false;
-        }
-        return true;
-    } else if(_command == U_SPIFFS) {
-        return true;
-    }
-    return false;
-}
+// bool UpdateClass::_verifyHeader(uint8_t data) {
+//     if(_command == U_FLASH) {
+//         if(data != ESP_IMAGE_HEADER_MAGIC) {
+//             _abort(UPDATE_ERROR_MAGIC_BYTE);
+//             return false;
+//         }
+//         return true;
+//     } else if(_command == U_SPIFFS) {
+//         return true;
+//     }
+//     return false;
+// }
 
 bool UpdateClass::_verifyEnd() {
     if(_command == U_FLASH) {
@@ -343,10 +514,10 @@ size_t UpdateClass::writeStream(Stream &data) {
     if(hasError() || !isRunning())
         return 0;
 
-    if(!_verifyHeader(data.peek())) {
-        _reset();
-        return 0;
-    }
+    // if(!_verifyHeader(data.peek())) {
+    //     _reset();
+    //     return 0;
+    // }
 
     if(_ledPin != -1) {
         pinMode(_ledPin, OUTPUT);
